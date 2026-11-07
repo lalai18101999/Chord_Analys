@@ -89,6 +89,31 @@
   cursor: pointer;
 }
 
+.access-panel {
+  margin-bottom: 18px;
+  padding: 13px 15px;
+  display: grid;
+  gap: 7px;
+  border: 1px solid #e8e9e1;
+  border-radius: 7px;
+  background: #fbfbf8;
+}
+.access-panel label { color: #55594b; font-size: 11px; font-weight: 700; }
+.access-form-row { display: flex; align-items: center; gap: 10px; }
+.access-form-row input {
+  min-width: 0;
+  min-height: 34px;
+  flex: 1;
+  padding: 0 10px;
+  border: 1px solid #dedfd6;
+  border-radius: 5px;
+  color: var(--ink);
+  background: #fff;
+  font: inherit;
+  font-size: 11px;
+}
+.access-help { color: #85877c; font-size: 10px; }
+
 .hero {
   padding: 70px 0 42px;
   text-align: center;
@@ -563,14 +588,28 @@ h1 span { color: #818376; }
 .secondary-download { color: #8b6943; border-color: #ece3d5; background: #fbf8f3; }
 
 .visual-scroll { max-width: 100%; margin-top: 11px; overflow-x: auto; border: 1px solid #e8e9e2; border-radius: 5px; background: #fff; }
-.piano-roll, .guitar-tab { display: block; width: 1080px; max-width: none; }
-.piano-lane { fill: #fff; }
-.black-lane { fill: #f7f8f5; }
+.piano-roll, .guitar-tab { display: block; max-width: none; }
+.piano-roll { width: min(100%, 1080px); min-width: 720px; }
+.guitar-tab { width: 1666px; }
+.piano-lane { fill: #fff; opacity: 0.48; }
+.black-lane { fill: #eef0e9; opacity: 0.7; }
+.falling-note-background { fill: #fbfcf8; }
+.piano-key { stroke-width: 0.9; transition: fill 80ms ease-out; }
+.white-key { fill: #fff; stroke: #c9cbbf; }
+.black-key { fill: #45483f; stroke: #30332d; }
+.piano-key.active-key.white-key { fill: #cce879; stroke: #758b3e; }
+.piano-key.active-key.black-key { fill: #b6dc55; stroke: #71883b; }
+.active-black-key-dot { fill: #556734; pointer-events: none; }
 .pitch-label, .string-label { fill: #84877a; font-size: 9px; font-family: inherit; }
 .time-label { fill: #9a9b91; font-size: 8px; font-family: inherit; }
 .piano-grid-line, .time-grid-line { stroke: #eceee8; stroke-width: 1; }
 .strong-grid { stroke: #dfe2d7; }
 .piano-note { fill: #859260; stroke: #667447; stroke-width: 0.6; }
+.falling-piano-note { fill: #91ad4c; stroke: #5f7535; stroke-width: 1; filter: drop-shadow(0 1px 2px rgb(65 78 39 / 20%)); transition: y 90ms linear; }
+.piano-time-line { stroke: #e6e9df; stroke-width: 1; stroke-dasharray: 3 4; pointer-events: none; }
+.piano-now-line { stroke: #d06f5d; stroke-width: 2; pointer-events: none; }
+.piano-time-label { fill: #929587; font-size: 9px; font-weight: 650; font-family: inherit; }
+.piano-key-label { fill: #72766a; font-size: 10px; font-weight: 600; font-family: inherit; }
 .playhead-line { stroke: #bf6657; stroke-width: 2; stroke-dasharray: 4 2; pointer-events: none; }
 .guitar-string { stroke: #c9cbbf; stroke-width: 1.2; }
 .tab-note { fill: #9b7447; stroke: white; stroke-width: 1.5; }
@@ -589,6 +628,18 @@ h1 span { color: #818376; }
 .stem-description { margin-bottom: 15px; color: #76786d; font-size: 11px; }
 .stem-audio { width: min(100%, 520px); height: 36px; display: block; }
 .stem-panel > .panel-download { margin-top: 11px; }
+
+.lyrics-sheet {
+  margin: 18px 0;
+  padding: 18px 16px;
+  border: 1px solid #e8e9e2;
+  border-radius: 6px;
+  background: #fcfcf9;
+}
+.lyric-line { margin: 0 0 15px; display: flex; flex-wrap: wrap; column-gap: 0.32em; row-gap: 0.4em; color: var(--ink); font-size: 13px; line-height: 1.65; }
+.lyric-line:last-child { margin-bottom: 0; }
+.lyric-word { display: inline-flex; flex-direction: column; min-width: 1ch; }
+.lyric-chord { min-height: 1.35em; color: #788651; font-size: 10px; font-weight: 750; line-height: 1.3; }
 
 .quality-note {
   margin-top: 13px;
@@ -623,6 +674,7 @@ h1 span { color: #818376; }
   .topbar { height: 68px; }
   .brand { gap: 7px; font-size: 17px; }
   .beta-tag { font-size: 8px; }
+  .engine-status { max-width: 46%; font-size: 9px; }
   .hero { padding: 53px 0 33px; }
   h1 { letter-spacing: -2px; }
   .hero-copy { max-width: 370px; font-size: 12px; }

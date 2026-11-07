@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useRef, useState, type SyntheticEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type FormEvent, type SyntheticEvent } from 'react'
 import './App.css'
 
 type EngineHealth = {
   ready: boolean
   message: string
+  password_required?: boolean
+  access_configured?: boolean
 }
 
 type TrackFile = {
@@ -23,15 +25,27 @@ type NoteEvent = {
   duration: number
 }
 
+type LyricWord = {
+  start: number
+  end: number
+  text: string
+}
+
+type LyricLine = {
+  start: number
+  words: LyricWord[]
+}
+
 type AnalysisResult = {
   id: string
   duration_seconds: number
   chords: Chord[]
   files: TrackFile[]
+  lyrics: LyricLine[]
+  guitar_lead_start_seconds: number | null
   visual_tracks: {
     piano: NoteEvent[]
     guitar_lead: NoteEvent[]
-    guitar_rhythm: NoteEvent[]
   }
   tempo_bpm: number
   notes: {
@@ -41,7 +55,8 @@ type AnalysisResult = {
   warnings: string[]
 }
 
-const apiBase = (import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.DEV ? '' : 'http://127.0.0.1:8000')).replace(/\/$/, '')
+const apiBase = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
+const isHosted = import.meta.env.VITE_HOSTED_MODE === 'true'
 const maxFileSize = 150 * 1024 * 1024
 const acceptedTypes = '.mp3,.wav,.flac,.m4a,.ogg,.aac'
 const pitchNames = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B']
@@ -63,77 +78,223 @@ function pitchName(pitch: number) {
   return `${pitchNames[pitch % 12]}${Math.floor(pitch / 12) - 1}`
 }
 
-function PianoRoll({ notes, start, playhead }: { notes: NoteEvent[]; start: number; playhead: number }) {
+function guitarTabNotes(notes: NoteEvent[]) {
+  const groups: Array<Array<{ note: NoteEvent; index: number }>> = []
+  notes
+    .map((note, index) => ({ note, index }))
+    .sort((a, b) => a.note.start - b.note.start)
+    .forEach((entry) => {
+      const currentGroup = groups[groups.length - 1]
+      if (!currentGroup || entry.note.start - currentGroup[0].note.start > 0.12) {
+        groups.push([entry])
+      } else {
+        currentGroup.push(entry)
+      }
+    })
+
+  const placements = new Map<number, { stringIndex: number; fret: number }>()
+  for (const group of groups) {
+    const uniquePitches = [...new Set(group.map(({ note }) => note.pitch))]
+      .map((pitch) => ({
+        pitch,
+        entries: group.filter(({ note }) => note.pitch === pitch),
+        positions: guitarStrings
+          .map((string, stringIndex) => ({ stringIndex, fret: pitch - string.pitch }))
+          .filter(({ fret }) => fret >= 0 && fret <= 22)
+          .sort((a, b) => a.fret - b.fret),
+      }))
+      .filter(({ positions }) => positions.length > 0)
+      .sort((a, b) => a.positions.length - b.positions.length || b.pitch - a.pitch)
+    const usedStrings = new Set<number>()
+
+    for (const item of uniquePitches) {
+      const position = item.positions.find(({ stringIndex }) => !usedStrings.has(stringIndex))
+        ?? item.positions[0]
+      usedStrings.add(position.stringIndex)
+      for (const entry of item.entries.slice(0, 1)) {
+        placements.set(entry.index, position)
+      }
+    }
+  }
+  return placements
+}
+
+function PianoRoll({ notes, start, playhead, isPlaying }: { notes: NoteEvent[]; start: number; playhead: number; isPlaying: boolean }) {
   const width = 1080
-  const rowHeight = 16
+  const height = 510
+  const keyboardTop = 426
+  const keyboardHeight = height - keyboardTop
+  const pixelsPerSecond = 46
+  const lookAheadSeconds = keyboardTop / pixelsPerSecond
   const lowest = notes.length ? Math.min(...notes.map((note) => note.pitch)) : 48
   const highest = notes.length ? Math.max(...notes.map((note) => note.pitch)) : 72
-  const minPitch = Math.floor((lowest - 2) / 12) * 12
-  const maxPitch = Math.ceil((highest + 2) / 12) * 12
-  const pitches = Array.from({ length: maxPitch - minPitch + 1 }, (_, index) => maxPitch - index)
-  const height = pitches.length * rowHeight
-  const visibleNotes = notes.filter((note) => note.start < start + 12 && note.start + note.duration >= start)
+  let minPitch = Math.max(21, Math.floor((lowest - 2) / 12) * 12)
+  let maxPitch = Math.min(109, Math.ceil((highest + 3) / 12) * 12)
+  if (maxPitch - minPitch < 24) {
+    maxPitch = Math.min(109, minPitch + 24)
+    minPitch = Math.max(21, maxPitch - 24)
+  }
+  const pitches = Array.from({ length: maxPitch - minPitch }, (_, index) => minPitch + index)
+  const whitePitches = pitches.filter((pitch) => ![1, 3, 6, 8, 10].includes(pitch % 12))
+  const whiteKeyWidth = width / whitePitches.length
+  let whiteKeyIndex = 0
+  const keys = pitches.map((pitch) => {
+    const isBlack = [1, 3, 6, 8, 10].includes(pitch % 12)
+    if (isBlack) {
+      return {
+        pitch,
+        isBlack,
+        x: Math.max(0, (whiteKeyIndex - 0.36) * whiteKeyWidth),
+        width: whiteKeyWidth * 0.72,
+      }
+    }
+    const key = { pitch, isBlack, x: whiteKeyIndex * whiteKeyWidth, width: whiteKeyWidth }
+    whiteKeyIndex += 1
+    return key
+  })
+  const currentTime = Math.max(start, Math.min(playhead, start + 12))
+  const activePitches = new Set(
+    isPlaying
+      ? notes
+        .filter((note) => note.start <= currentTime && note.start + note.duration > currentTime)
+        .map((note) => note.pitch)
+      : [],
+  )
+  const visibleNotes = notes.filter(
+    (note) => note.start + note.duration > currentTime && note.start < currentTime + lookAheadSeconds,
+  )
+  const noteAreaId = 'falling-notes-area'
 
   return (
     <div className="visual-scroll">
-      <svg className="piano-roll" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Piano roll showing detected notes by pitch and time">
-        {pitches.map((pitch, index) => {
-          const y = index * rowHeight
-          const isBlackKey = [1, 3, 6, 8, 10].includes(pitch % 12)
+      <svg className="piano-roll" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Piano keys light up as detected notes reach them">
+        <defs>
+          <clipPath id={noteAreaId}>
+            <rect x="0" y="0" width={width} height={keyboardTop} />
+          </clipPath>
+        </defs>
+        <rect x="0" y="0" width={width} height={keyboardTop} className="falling-note-background" />
+        {keys.map((key) => (
+          <rect
+            key={`lane-${key.pitch}`}
+            x={key.x}
+            y="0"
+            width={key.width}
+            height={keyboardTop}
+            className={key.isBlack ? 'piano-lane black-lane' : 'piano-lane'}
+          />
+        ))}
+        {Array.from({ length: Math.floor(lookAheadSeconds) + 1 }, (_, secondsAhead) => {
+          const y = keyboardTop - secondsAhead * pixelsPerSecond
           return (
-            <g key={pitch}>
-              <rect x="0" y={y} width={width} height={rowHeight} className={isBlackKey ? 'piano-lane black-lane' : 'piano-lane'} />
-              <text x="5" y={y + 11} className="pitch-label">{pitchName(pitch)}</text>
-              <line x1="44" x2={width} y1={y + rowHeight} y2={y + rowHeight} className="piano-grid-line" />
+            <g key={`time-${secondsAhead}`}>
+              <line x1="0" x2={width} y1={y} y2={y} className={secondsAhead === 0 ? 'piano-now-line' : 'piano-time-line'} />
+              <text x="7" y={Math.max(13, y - 4)} className="piano-time-label">
+                {secondsAhead === 0 ? 'NOW' : `+${secondsAhead}s`}
+              </text>
             </g>
           )
         })}
-        {Array.from({ length: 13 }, (_, index) => (
-          <g key={index}>
-            <line x1={44 + index * 86} x2={44 + index * 86} y1="0" y2={height} className={index % 2 === 0 ? 'time-grid-line strong-grid' : 'time-grid-line'} />
-            <text x={47 + index * 86} y="12" className="time-label">{formatTime(start + index)}</text>
+        <g clipPath={`url(#${noteAreaId})`}>
+          {visibleNotes.map((note, index) => {
+            const key = keys.find((candidate) => candidate.pitch === note.pitch)
+            if (!key) return null
+            const noteTop = keyboardTop - (note.start + note.duration - currentTime) * pixelsPerSecond
+            const noteBottom = keyboardTop - (note.start - currentTime) * pixelsPerSecond
+            const noteWidth = Math.max(3, key.width * (key.isBlack ? 0.72 : 0.64))
+            return (
+              <rect
+                key={`${note.pitch}-${note.start}-${index}`}
+                x={key.x + (key.width - noteWidth) / 2}
+                y={noteTop}
+                width={noteWidth}
+                height={Math.max(3, noteBottom - noteTop)}
+                rx="3"
+                className="falling-piano-note"
+              >
+                <title>{pitchName(note.pitch)} · {formatTime(note.start)} · {(note.duration).toFixed(2)}s</title>
+              </rect>
+            )
+          })}
+        </g>
+        {keys.filter((key) => !key.isBlack).map((key) => (
+          <g key={`white-${key.pitch}`}>
+            <rect
+              x={key.x}
+              y={keyboardTop}
+              width={key.width}
+              height={keyboardHeight}
+              className={`piano-key white-key ${activePitches.has(key.pitch) ? 'active-key' : ''}`}
+            />
+            {key.pitch % 12 === 0 && key.width >= 18 && (
+              <text x={key.x + 3} y={height - 8} className="piano-key-label">{pitchName(key.pitch)}</text>
+            )}
           </g>
         ))}
-        {visibleNotes.map((note, index) => {
-          const row = maxPitch - note.pitch
-          const noteStart = Math.max(start, note.start)
-          const noteEnd = Math.min(start + 12, note.start + note.duration)
-          const x = 44 + (noteStart - start) * 86
-          const noteWidth = Math.min(Math.max(4, (noteEnd - noteStart) * 86), width - x)
-          return (
+        {keys.filter((key) => key.isBlack).map((key) => (
+          <g key={`black-${key.pitch}`}>
             <rect
-              key={`${note.pitch}-${note.start}-${index}`}
-              x={x}
-              y={row * rowHeight + 3}
-              width={noteWidth}
-              height={rowHeight - 6}
-              rx="3"
-              className="piano-note"
-            >
-              <title>{pitchName(note.pitch)} · {formatTime(note.start)}</title>
-            </rect>
-          )
-        })}
-        {playhead >= start && playhead <= start + 12 && (
-          <line x1={44 + (playhead - start) * 86} x2={44 + (playhead - start) * 86} y1="0" y2={height} className="playhead-line" />
-        )}
+              x={key.x}
+              y={keyboardTop}
+              width={key.width}
+              height={keyboardHeight * 0.64}
+              rx="1"
+              className={`piano-key black-key ${activePitches.has(key.pitch) ? 'active-key' : ''}`}
+            />
+            {activePitches.has(key.pitch) && (
+              <circle cx={key.x + key.width / 2} cy={keyboardTop + keyboardHeight * 0.53} r="3" className="active-black-key-dot" />
+            )}
+          </g>
+        ))}
       </svg>
     </div>
   )
 }
 
+function ChordLyrics({ lyrics, chords }: { lyrics: LyricLine[]; chords: Chord[] }) {
+  return (
+    <div className="lyrics-sheet">
+      {lyrics.map((line, lineIndex) => {
+        const chordsByWord = line.words.map((word) => chords.reduce(
+          (active, item) => item.time <= word.start ? item.name : active,
+          '',
+        ))
+        return (
+          <p className="lyric-line" key={`${line.start}-${lineIndex}`}>
+            {line.words.map((word, wordIndex) => {
+              const chord = chordsByWord[wordIndex]
+              const previousChord = wordIndex > 0 ? chordsByWord[wordIndex - 1] : ''
+              const chordLabel = chord && chord !== previousChord ? chord : ''
+              return (
+                <span className="lyric-word" key={`${word.start}-${wordIndex}`}>
+                  <span className="lyric-chord">{chordLabel || '\u00a0'}</span>
+                  <span>{word.text.trim()}</span>
+                </span>
+              )
+            })}
+          </p>
+        )
+      })}
+    </div>
+  )
+}
+
 function GuitarTab({ notes, start, playhead }: { notes: NoteEvent[]; start: number; playhead: number }) {
-  const width = 1080
+  const secondsWidth = 132
+  const width = 1666
   const xOffset = 50
-  const visibleNotes = notes.filter((note) => note.start >= start && note.start < start + 12)
+  const visibleNotes = notes
+    .map((note, index) => ({ note, index }))
+    .filter(({ note }) => note.start >= start && note.start < start + 12)
+  const placements = guitarTabNotes(notes)
 
   return (
     <div className="visual-scroll">
       <svg className="guitar-tab" viewBox={`0 0 ${width} 220`} role="img" aria-label="Estimated guitar tablature by string and fret">
         {Array.from({ length: 13 }, (_, index) => (
           <g key={index}>
-            <line x1={xOffset + index * 84} x2={xOffset + index * 84} y1="32" y2="196" className={index % 4 === 0 ? 'time-grid-line strong-grid' : 'time-grid-line'} />
-            <text x={xOffset + index * 84 + 2} y="20" className="time-label">{formatTime(start + index)}</text>
+            <line x1={xOffset + index * secondsWidth} x2={xOffset + index * secondsWidth} y1="32" y2="196" className={index % 4 === 0 ? 'time-grid-line strong-grid' : 'time-grid-line'} />
+            <text x={xOffset + index * secondsWidth + 2} y="20" className="time-label">{formatTime(start + index)}</text>
           </g>
         ))}
         {guitarStrings.map((string, index) => (
@@ -142,24 +303,21 @@ function GuitarTab({ notes, start, playhead }: { notes: NoteEvent[]; start: numb
             <line x1={xOffset} x2={width} y1={52 + index * 27} y2={52 + index * 27} className="guitar-string" />
           </g>
         ))}
-        {visibleNotes.map((note, index) => {
-          const playable = guitarStrings
-            .map((string, stringIndex) => ({ stringIndex, fret: note.pitch - string.pitch }))
-            .filter(({ fret }) => fret >= 0 && fret <= 22)
-            .sort((a, b) => a.fret - b.fret)[0]
+        {visibleNotes.map(({ note, index }) => {
+          const playable = placements.get(index)
           if (!playable) return null
-          const x = xOffset + (note.start - start) * 84
+          const x = xOffset + (note.start - start) * secondsWidth
           const y = 52 + playable.stringIndex * 27
           return (
             <g key={`${note.pitch}-${note.start}-${index}`}>
-              <circle cx={x} cy={y} r="9" className="tab-note" />
+              <circle cx={x} cy={y} r="7" className="tab-note" />
               <text x={x} y={y + 3.5} className="fret-label">{playable.fret}</text>
               <title>{pitchName(note.pitch)} · fret {playable.fret} · {formatTime(note.start)}</title>
             </g>
           )
         })}
         {playhead >= start && playhead <= start + 12 && (
-          <line x1={xOffset + (playhead - start) * 84} x2={xOffset + (playhead - start) * 84} y1="32" y2="196" className="playhead-line" />
+          <line x1={xOffset + (playhead - start) * secondsWidth} x2={xOffset + (playhead - start) * secondsWidth} y1="32" y2="196" className="playhead-line" />
         )}
       </svg>
     </div>
@@ -169,14 +327,19 @@ function GuitarTab({ notes, start, playhead }: { notes: NoteEvent[]; start: numb
 function App() {
   const inputRef = useRef<HTMLInputElement>(null)
   const originalAudioRef = useRef<HTMLAudioElement>(null)
+  const pianoAudioRef = useRef<HTMLAudioElement>(null)
   const audioUrlRef = useRef('')
   const [file, setFile] = useState<File | null>(null)
   const [audioUrl, setAudioUrl] = useState('')
   const [health, setHealth] = useState<EngineHealth | null>(null)
+  const [accessPassword, setAccessPassword] = useState(() => sessionStorage.getItem('chordcraft-password') ?? '')
+  const [passwordDraft, setPasswordDraft] = useState(() => sessionStorage.getItem('chordcraft-password') ?? '')
   const [result, setResult] = useState<AnalysisResult | null>(null)
   const [error, setError] = useState('')
   const [isDragging, setIsDragging] = useState(false)
   const [isAnalyzing, setIsAnalyzing] = useState(false)
+  const [isCheckingPassword, setIsCheckingPassword] = useState(false)
+  const [isPlaying, setIsPlaying] = useState(false)
   const [activeSection, setActiveSection] = useState('overview')
   const [viewStart, setViewStart] = useState(0)
   const [playhead, setPlayhead] = useState(0)
@@ -190,10 +353,16 @@ function App() {
     } catch {
       setHealth({
         ready: false,
-        message: 'Local engine is offline. Start it using the setup guide.',
+        message: isHosted ? 'Analysis server is offline.' : 'Local engine is offline. Start it using the setup guide.',
       })
     }
   }, [])
+
+  useEffect(() => {
+    // Load server state on page open so hosted users can enter the beta password before uploading.
+    // oxlint-disable-next-line react/set-state-in-effect
+    void checkEngine()
+  }, [checkEngine])
 
   useEffect(() => {
     return () => {
@@ -226,6 +395,35 @@ function App() {
     if (!health) void checkEngine()
   }
 
+  async function saveAccessPassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!passwordDraft) return
+    setIsCheckingPassword(true)
+    setError('')
+    try {
+      const response = await fetch(`${apiBase}/api/auth/verify`, {
+        method: 'POST',
+        headers: { 'X-Chordcraft-Password': passwordDraft },
+      })
+      const body = (await response.json()) as { detail?: string }
+      if (!response.ok) {
+        throw new Error(body.detail ?? 'Could not verify the beta password.')
+      }
+      sessionStorage.setItem('chordcraft-password', passwordDraft)
+      setAccessPassword(passwordDraft)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not verify the beta password.')
+    } finally {
+      setIsCheckingPassword(false)
+    }
+  }
+
+  function clearAccessPassword() {
+    sessionStorage.removeItem('chordcraft-password')
+    setAccessPassword('')
+    setPasswordDraft('')
+  }
+
   async function analyze() {
     if (!file) return
     setIsAnalyzing(true)
@@ -238,11 +436,13 @@ function App() {
     try {
       const response = await fetch(`${apiBase}/api/analyze`, {
         method: 'POST',
+        headers: accessPassword ? { 'X-Chordcraft-Password': accessPassword } : undefined,
         body: formData,
       })
       const body = (await response.json()) as AnalysisResult & { detail?: string }
+      if (response.status === 401) clearAccessPassword()
       if (!response.ok) {
-        throw new Error(body.detail ?? 'Analysis failed. Check the local engine logs.')
+        throw new Error(body.detail ?? (isHosted ? 'Analysis failed on the server.' : 'Analysis failed. Check the local engine logs.'))
       }
       setResult(body)
       setActiveSection('overview')
@@ -258,10 +458,9 @@ function App() {
   const sectionOptions = [
     { id: 'overview', label: 'Overview', icon: '◫' },
     { id: 'piano', label: 'Piano', icon: '▤' },
-    { id: 'lead', label: 'Guitar lead', icon: '⌁' },
-    { id: 'rhythm', label: 'Guitar rhythm', icon: '♫' },
+    { id: 'lead', label: 'Guitar tab', icon: '⌁' },
     { id: 'bass', label: 'Bass', icon: '≋' },
-    { id: 'vocals', label: 'Vocals', icon: '◖' },
+    { id: 'vocals', label: 'Lyrics + chords', icon: '◖' },
   ]
   const activeChordIndex = result?.chords.reduce(
     (activeIndex, chord, index) => chord.time <= playhead ? index : activeIndex,
@@ -291,6 +490,23 @@ function App() {
     setViewStart(Math.floor(time / 12) * 12)
   }
 
+  function startPlayback(event: SyntheticEvent<HTMLAudioElement>) {
+    const activeAudio = event.currentTarget
+    const otherAudio = activeAudio === originalAudioRef.current
+      ? pianoAudioRef.current
+      : originalAudioRef.current
+    if (otherAudio && !otherAudio.paused) otherAudio.pause()
+    syncPlayback(event)
+    setIsPlaying(true)
+  }
+
+  function stopPlayback() {
+    setIsPlaying(Boolean(
+      (originalAudioRef.current && !originalAudioRef.current.paused)
+      || (pianoAudioRef.current && !pianoAudioRef.current.paused),
+    ))
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -302,11 +518,11 @@ function App() {
             <span />
           </span>
           <span>chordcraft</span>
-          <span className="beta-tag">LOCAL BETA</span>
+          <span className="beta-tag">BETA</span>
         </a>
         <div className={`engine-status ${health?.ready ? 'online' : 'offline'}`}>
           <span className="status-dot" />
-          {health?.ready ? 'Engine ready' : health ? 'Engine offline' : 'Engine not checked'}
+          {health?.ready ? (health.password_required ? 'Server ready · beta access' : 'Engine ready') : health?.message ?? 'Engine not checked'}
           <button className="icon-button refresh-button" onClick={() => void checkEngine()} aria-label="Refresh engine status">
             ↻
           </button>
@@ -317,9 +533,9 @@ function App() {
         <div className="eyebrow"><span className="eyebrow-line" /> YOUR SONG, UNPACKED</div>
         <h1>Hear every part.<br /><span>See how it’s played.</span></h1>
         <p className="hero-copy">
-          Turn a song into separate instrument tracks, piano MIDI, and guitar tabs — processed on your computer.
+          Turn a song into separate instrument tracks, piano MIDI, a lead guitar tab, and lyrics with chords.
         </p>
-        <div className="privacy-note"><span aria-hidden="true">◈</span> Your audio stays on this device</div>
+        <div className="privacy-note"><span aria-hidden="true">◈</span> {isHosted ? 'Audio is uploaded securely for analysis and deleted after 24 hours' : 'Your audio stays on this device'}</div>
       </section>
 
       <section className={`workspace ${result ? 'has-result' : ''}`}>
@@ -330,6 +546,32 @@ function App() {
           </div>
           <span className="file-limit">Up to 150 MB</span>
         </div>
+
+        {health?.password_required && (
+          <form className="access-panel" onSubmit={saveAccessPassword}>
+            <label htmlFor="access-password">Shared beta password</label>
+            {health.access_configured ? (
+              <>
+                <div className="access-form-row">
+                  <input
+                    id="access-password"
+                    type="password"
+                    autoComplete="current-password"
+                    value={passwordDraft}
+                    onChange={(event) => setPasswordDraft(event.currentTarget.value)}
+                    placeholder="Enter the password shared by the app owner"
+                  />
+                  <button className="text-button" type="submit" disabled={!passwordDraft || isCheckingPassword}>
+                    {isCheckingPassword ? 'Checking…' : 'Verify'}
+                  </button>
+                </div>
+                <span className="access-help">{accessPassword ? 'Password is kept in this browser session.' : 'Ask the app owner for the beta password.'}</span>
+              </>
+            ) : (
+              <span className="access-help" role="status">{health.message}</span>
+            )}
+          </form>
+        )}
 
         {!file ? (
           <button
@@ -376,9 +618,9 @@ function App() {
           <div className="analyze-row">
             <div className="engine-hint">
               <span className={`mini-dot ${health?.ready ? 'ready' : ''}`} />
-              {health?.message ?? 'Checking local engine…'}
+              {health?.message ?? (isHosted ? 'Checking analysis server…' : 'Checking local engine…')}
             </div>
-            <button className="primary-button" disabled={!health?.ready || isAnalyzing} onClick={() => void analyze()}>
+            <button className="primary-button" disabled={!health?.ready || (health.password_required && !accessPassword) || isAnalyzing} onClick={() => void analyze()}>
               {isAnalyzing ? <><span className="spinner" /> Analyzing song…</> : <>Analyze song <span aria-hidden="true">→</span></>}
             </button>
           </div>
@@ -389,7 +631,7 @@ function App() {
         <section className="progress-card" aria-live="polite">
           <div className="progress-top"><span>Listening to your song</span><span className="pulse-dot" /></div>
           <div className="progress-track"><div className="progress-indicator" /></div>
-          <p>Separating instruments and transcribing piano and guitar. This can take several minutes on a CPU.</p>
+          <p>{isHosted ? 'Uploading the audio to the analysis server. ' : 'Processing on your computer. ' }The first lyrics run downloads its speech model; processing can take several minutes.</p>
         </section>
       )}
 
@@ -404,9 +646,21 @@ function App() {
             <div className="player-cover" aria-hidden="true"><span>♫</span></div>
             <div className="player-track">
               <strong>{file?.name.replace(/\.[^.]+$/, '')}</strong>
-              <span>Original audio · stays on your device</span>
+              <span>{isHosted ? 'Original audio · uploaded to the analysis server' : 'Original audio · stays on this device'}</span>
             </div>
-            {audioUrl && <audio ref={originalAudioRef} className="audio-player" controls src={audioUrl} onTimeUpdate={syncPlayback} onSeeked={syncPlayback} />}
+            {audioUrl && (
+              <audio
+                ref={originalAudioRef}
+                className="audio-player"
+                controls
+                src={audioUrl}
+                onPlay={startPlayback}
+                onPause={stopPlayback}
+                onEnded={stopPlayback}
+                onTimeUpdate={syncPlayback}
+                onSeeked={syncPlayback}
+              />
+            )}
           </div>
 
           <nav className="instrument-nav" aria-label="Song parts">
@@ -458,42 +712,50 @@ function App() {
           {activeSection === 'piano' && (
             <section className="instrument-panel">
               <div className="panel-heading">
-                <div><span className="panel-kicker">PIANO TRANSCRIPTION</span><h3>Piano roll</h3></div>
+                <div><span className="panel-kicker">PIANO TRANSCRIPTION</span><h3>Falling notes · piano keys</h3></div>
                 <span>{result.notes.piano} notes · {result.tempo_bpm || 120} BPM</span>
               </div>
               <div className="panel-player">
-                {getTrack('Piano') && <audio controls src={`${apiBase}${getTrack('Piano')!.url}`} aria-label="Play piano stem" />}
+                {getTrack('Piano') && (
+                  <audio
+                    ref={pianoAudioRef}
+                    controls
+                    src={`${apiBase}${getTrack('Piano')!.url}`}
+                    aria-label="Play piano stem"
+                    onPlay={startPlayback}
+                    onPause={stopPlayback}
+                    onEnded={stopPlayback}
+                    onTimeUpdate={syncPlayback}
+                    onSeeked={syncPlayback}
+                  />
+                )}
                 {downloadLink('Piano MIDI') && <a className="panel-download" href={downloadLink('Piano MIDI')} download>Download MIDI <span aria-hidden="true">↓</span></a>}
               </div>
               {(result.visual_tracks?.piano ?? []).length ? (
-                <PianoRoll notes={result.visual_tracks.piano} start={viewStart} playhead={playhead} />
+                <PianoRoll notes={result.visual_tracks.piano} start={viewStart} playhead={playhead} isPlaying={isPlaying} />
               ) : <p className="empty-state">No piano notes are available. Check whether the separator returned a piano stem.</p>}
-              {(result.visual_tracks?.piano ?? []).length > 0 && <p className="playback-hint"><span className="playhead-dot" /> Auto-follow follows the original song playback</p>}
+              {(result.visual_tracks?.piano ?? []).length > 0 && <p className="playback-hint"><span className="playhead-dot" /> Notes fall to the keys; keys light up when played</p>}
               <div className="visual-controls"><button onClick={() => setViewStart(Math.max(0, viewStart - 12))} disabled={viewStart === 0}>← Previous</button><span>{formatTime(viewStart)} – {formatTime(Math.min(result.duration_seconds, viewStart + 12))}</span><button onClick={() => setViewStart(Math.min(Math.max(0, result.duration_seconds - 12), viewStart + 12))} disabled={viewStart + 12 >= result.duration_seconds}>Next →</button></div>
             </section>
           )}
 
-          {(activeSection === 'lead' || activeSection === 'rhythm') && (() => {
-            const isLead = activeSection === 'lead'
-            const notes = isLead ? result.visual_tracks?.guitar_lead ?? [] : result.visual_tracks?.guitar_rhythm ?? []
-            const title = isLead ? 'Guitar lead' : 'Guitar rhythm'
-            const midiLabel = `${title} MIDI`
-            const tabLabel = `${title} TAB`
+          {activeSection === 'lead' && (() => {
+            const notes = result.visual_tracks?.guitar_lead ?? []
             return (
               <section className="instrument-panel">
                 <div className="panel-heading">
-                  <div><span className="panel-kicker">GUITAR TRANSCRIPTION</span><h3>{title} · fretboard view</h3></div>
-                  <span>{notes.length} notes · estimated part</span>
+                  <div><span className="panel-kicker">GUITAR TRANSCRIPTION</span><h3>Lead guitar · fretboard tab</h3></div>
+                  <span>{notes.length} notes · {result.guitar_lead_start_seconds === null ? 'no lead detected' : `lead from ${formatTime(result.guitar_lead_start_seconds)}`}</span>
                 </div>
                 <div className="panel-player">
                   {getTrack('Guitar') && <audio controls src={`${apiBase}${getTrack('Guitar')!.url}`} aria-label="Play guitar stem" />}
-                  {downloadLink(midiLabel) && <a className="panel-download" href={downloadLink(midiLabel)} download>Download MIDI <span aria-hidden="true">↓</span></a>}
-                  {downloadLink(tabLabel) && <a className="panel-download secondary-download" href={downloadLink(tabLabel)} download>Download TAB <span aria-hidden="true">↓</span></a>}
+                  {downloadLink('Guitar MIDI') && <a className="panel-download" href={downloadLink('Guitar MIDI')} download>Download MIDI <span aria-hidden="true">↓</span></a>}
+                  {downloadLink('Guitar TAB') && <a className="panel-download secondary-download" href={downloadLink('Guitar TAB')} download>Download TAB <span aria-hidden="true">↓</span></a>}
                 </div>
-                {notes.length ? <GuitarTab notes={notes} start={viewStart} playhead={playhead} /> : <p className="empty-state">No notes are available for this guitar part.</p>}
+                {notes.length ? <GuitarTab notes={notes} start={viewStart} playhead={playhead} /> : <p className="empty-state">No clear lead phrase was detected. The app hides the guitar tab rather than treating the intro accompaniment as a lead.</p>}
                 {notes.length > 0 && <p className="playback-hint"><span className="playhead-dot" /> Auto-follow follows the original song playback</p>}
                 <div className="visual-controls"><button onClick={() => setViewStart(Math.max(0, viewStart - 12))} disabled={viewStart === 0}>← Previous</button><span>{formatTime(viewStart)} – {formatTime(Math.min(result.duration_seconds, viewStart + 12))}</span><button onClick={() => setViewStart(Math.min(Math.max(0, result.duration_seconds - 12), viewStart + 12))} disabled={viewStart + 12 >= result.duration_seconds}>Next →</button></div>
-                <p className="panel-footnote">Standard tuning · fret positions are estimated from detected pitches.</p>
+                <p className="panel-footnote">Standard tuning · lead start and fret positions are inferred from the guitar stem and may need correction.</p>
               </section>
             )
           })()}
@@ -504,21 +766,36 @@ function App() {
             return (
               <section className="instrument-panel stem-panel">
                 <div className="panel-heading">
-                  <div><span className="panel-kicker">SEPARATED AUDIO</span><h3>{name} track</h3></div>
+                  <div><span className="panel-kicker">{name === 'Vocals' ? 'VOICE RECOGNITION' : 'SEPARATED AUDIO'}</span><h3>{name === 'Vocals' ? 'Lyrics + chords' : `${name} track`}</h3></div>
                   <span>{track ? 'Ready to play' : 'Not available'}</span>
                 </div>
-                <div className={`stem-art ${name.toLowerCase()}`} aria-hidden="true">{name === 'Bass' ? '≋' : '◖'}</div>
-                <p className="stem-description">{track ? `Listen to the isolated ${name.toLowerCase()} part from the separation model.` : `The separation model did not return a ${name.toLowerCase()} stem for this file.`}</p>
-                {track && <audio className="stem-audio" controls src={`${apiBase}${track.url}`} aria-label={`Play ${name} stem`} />}
-                {track && <a className="panel-download" href={`${apiBase}${track.url}`} download>{`Download ${name} audio`} <span aria-hidden="true">↓</span></a>}
-                <p className="panel-footnote">Pitch transcription for this part is planned for a later phase.</p>
+                {name === 'Vocals' ? (
+                  <>
+                    {result.lyrics.length ? (
+                      <ChordLyrics lyrics={result.lyrics} chords={result.chords} />
+                    ) : (
+                      <p className="empty-state">No lyrics were recognized. Try a clearer vocal stem or check the original audio.</p>
+                    )}
+                    {track && <audio className="stem-audio" controls src={`${apiBase}${track.url}`} aria-label="Play vocals stem" />}
+                    {track && <a className="panel-download" href={`${apiBase}${track.url}`} download>Download vocals audio <span aria-hidden="true">↓</span></a>}
+                    <p className="panel-footnote">Lyrics are transcribed locally; chord positions are matched to estimated word timings.</p>
+                  </>
+                ) : (
+                  <>
+                    <div className="stem-art bass" aria-hidden="true">≋</div>
+                    <p className="stem-description">{track ? 'Listen to the isolated bass part from the separation model.' : 'The separation model did not return a bass stem for this file.'}</p>
+                    {track && <audio className="stem-audio" controls src={`${apiBase}${track.url}`} aria-label="Play Bass stem" />}
+                    {track && <a className="panel-download" href={`${apiBase}${track.url}`} download>Download Bass audio <span aria-hidden="true">↓</span></a>}
+                    <p className="panel-footnote">Pitch transcription for this part is planned for a later phase.</p>
+                  </>
+                )}
               </section>
             )
           })()}
 
           <div className="quality-note">
             <span aria-hidden="true">ⓘ</span>
-            <p>{result.warnings.join(' ')} Rhythm/lead are preliminary parts inferred from one guitar stem, not separately isolated recordings.</p>
+            <p>{result.warnings.join(' ')}</p>
           </div>
         </section>
       )}
@@ -528,8 +805,8 @@ function App() {
           <span className="step-label">WHAT YOU’LL GET</span>
           <div className="workflow-steps">
             <div className="workflow-item"><span className="workflow-number">01</span><div><strong>Separate the mix</strong><p>Vocals, bass, piano, and guitar stems</p></div></div>
-            <div className="workflow-item"><span className="workflow-number">02</span><div><strong>Transcribe instruments</strong><p>Piano MIDI and draft guitar parts</p></div></div>
-            <div className="workflow-item"><span className="workflow-number">03</span><div><strong>Take it further</strong><p>Listen, download, and refine your parts</p></div></div>
+            <div className="workflow-item"><span className="workflow-number">02</span><div><strong>Transcribe instruments</strong><p>Piano MIDI and a lead-focused guitar tab</p></div></div>
+            <div className="workflow-item"><span className="workflow-number">03</span><div><strong>Follow the song</strong><p>Read lyrics with chords, listen, and download</p></div></div>
           </div>
         </section>
       )}
