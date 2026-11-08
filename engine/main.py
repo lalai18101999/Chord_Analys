@@ -3,16 +3,15 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
-import urllib.error
 import uuid
 import wave
-from functools import lru_cache
 from importlib.util import find_spec
 from collections import Counter, defaultdict, deque
 from contextlib import asynccontextmanager
@@ -21,9 +20,9 @@ from typing import Any
 
 import mido
 import ffmpeg as ffmpeg_bundle
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 
 ROOT = Path(__file__).resolve().parent
@@ -165,7 +164,11 @@ def safe_job_file(job_id: str, filename: str) -> Path:
     return path
 
 
-def run_command(command: list[str], timeout: int, step: str) -> None:
+def run_command(
+    command: list[str],
+    timeout: int,
+    step: str,
+) -> None:
     try:
         environment = os.environ.copy()
         environment["PYTHONUTF8"] = "1"
@@ -199,8 +202,143 @@ def run_command(command: list[str], timeout: int, step: str) -> None:
         raise HTTPException(status_code=500, detail=f"{step} failed: {details}")
 
 
-async def run_command_async(command: list[str], timeout: int, step: str) -> None:
+async def run_command_async(
+    command: list[str],
+    timeout: int,
+    step: str,
+) -> None:
     await asyncio.to_thread(run_command, command, timeout, step)
+
+
+def solola_compatible_lead_notes(
+    guitar_stem: Path,
+) -> list[dict[str, float | int]]:
+    if find_spec("librosa") is None:
+        raise HTTPException(
+            status_code=503,
+            detail="The SoloLa-compatible engine requires librosa in the current Python environment.",
+        )
+
+    try:
+        import librosa
+        import numpy as np
+
+        sample_rate = 22050
+        hop_length = 256
+        frame_length = 2048
+        audio, _ = librosa.load(guitar_stem, sr=sample_rate, mono=True)
+        if len(audio) < frame_length:
+            raise HTTPException(
+                status_code=422,
+                detail="The separated guitar stem is too short for lead transcription.",
+            )
+        frequencies, voiced, confidence = librosa.pyin(
+            audio,
+            fmin=librosa.note_to_hz("E2"),
+            fmax=librosa.note_to_hz("E6"),
+            sr=sample_rate,
+            frame_length=frame_length,
+            hop_length=hop_length,
+        )
+    except HTTPException:
+        raise
+    except (OSError, ValueError, RuntimeError) as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"SoloLa-compatible pitch extraction failed: {error}",
+        ) from error
+
+    raw_pitches = np.full(len(frequencies), -1, dtype=int)
+    usable = voiced & np.isfinite(frequencies) & (confidence >= 0.55)
+    raw_pitches[usable] = np.rint(librosa.hz_to_midi(frequencies[usable])).astype(int)
+
+    smoothed = raw_pitches.copy()
+    for frame in range(len(raw_pitches)):
+        if raw_pitches[frame] < 0:
+            continue
+        neighborhood = raw_pitches[max(0, frame - 2):min(len(raw_pitches), frame + 3)]
+        valid = sorted(int(pitch) for pitch in neighborhood if pitch >= 0)
+        if valid:
+            smoothed[frame] = valid[len(valid) // 2]
+
+    for frame in range(1, len(smoothed) - 1):
+        if smoothed[frame] < 0 and smoothed[frame - 1] == smoothed[frame + 1]:
+            smoothed[frame] = smoothed[frame - 1]
+
+    notes: list[dict[str, float | int]] = []
+    run_start = 0
+    while run_start < len(smoothed):
+        pitch = int(smoothed[run_start])
+        run_end = run_start + 1
+        while run_end < len(smoothed) and smoothed[run_end] == pitch:
+            run_end += 1
+        duration = (run_end - run_start) * hop_length / sample_rate
+        if pitch >= 0 and duration >= 0.08:
+            notes.append(
+                {
+                    "pitch": pitch,
+                    "start": max(0.0, run_start * hop_length / sample_rate - hop_length / (2 * sample_rate)),
+                    "duration": duration,
+                }
+            )
+        run_start = run_end
+
+    if not notes:
+        raise HTTPException(
+            status_code=422,
+            detail="No stable lead notes were detected in the separated guitar stem.",
+        )
+    return notes
+
+
+def write_visual_notes_midi(
+    notes: list[dict[str, float | int]],
+    destination: Path,
+    ticks_per_beat: int,
+    tempo: int,
+) -> list[dict[str, Any]]:
+    midi = mido.MidiFile(type=1, ticks_per_beat=ticks_per_beat)
+    meta_track = mido.MidiTrack()
+    meta_track.append(mido.MetaMessage("set_tempo", tempo=tempo, time=0))
+    meta_track.append(mido.MetaMessage("end_of_track", time=0))
+    midi.tracks.append(meta_track)
+
+    ticks_per_second = ticks_per_beat * 1_000_000 / tempo
+    tick_notes: list[dict[str, Any]] = []
+    events: list[tuple[int, int, mido.Message]] = []
+    for note in notes:
+        start_tick = round(float(note["start"]) * ticks_per_second)
+        end_tick = max(
+            start_tick + 1,
+            round((float(note["start"]) + float(note["duration"])) * ticks_per_second),
+        )
+        pitch = int(note["pitch"])
+        tick_notes.append(
+            {
+                "pitch": pitch,
+                "start_tick": start_tick,
+                "end_tick": end_tick,
+                "velocity": 90,
+                "channel": 0,
+            }
+        )
+        events.extend(
+            [
+                (start_tick, 1, mido.Message("note_on", channel=0, note=pitch, velocity=90)),
+                (end_tick, 0, mido.Message("note_off", channel=0, note=pitch, velocity=0)),
+            ]
+        )
+    events.sort(key=lambda event: (event[0], event[1]))
+    track = mido.MidiTrack()
+    previous_tick = 0
+    for tick, _, message in events:
+        message.time = tick - previous_tick
+        track.append(message)
+        previous_tick = tick
+    track.append(mido.MetaMessage("end_of_track", time=0))
+    midi.tracks.append(track)
+    midi.save(destination)
+    return tick_notes
 
 
 def midi_notes(path: Path) -> list[dict[str, Any]]:
@@ -227,6 +365,49 @@ def midi_notes(path: Path) -> list[dict[str, Any]]:
                         }
                     )
     return notes
+
+
+def remove_notes_before_audio_onset(
+    notes: list[dict[str, Any]],
+    audio_path: Path,
+    ticks_per_beat: int,
+    tempo: int,
+) -> list[dict[str, Any]]:
+    import librosa
+    import numpy as np
+
+    sample_rate = 22050
+    hop_length = 256
+    audio, _ = librosa.load(audio_path, sr=sample_rate, mono=True)
+    if not len(audio):
+        return []
+
+    rms = librosa.feature.rms(y=audio, frame_length=2048, hop_length=hop_length)[0]
+    peak = float(np.max(rms, initial=0))
+    if peak <= 1e-8:
+        return []
+
+    threshold = peak * 0.02
+    active_frames = rms > threshold
+    consecutive_frames = 3
+    onset_frame = next(
+        (
+            index
+            for index in range(max(0, len(active_frames) - consecutive_frames + 1))
+            if np.all(active_frames[index:index + consecutive_frames])
+        ),
+        None,
+    )
+    if onset_frame is None:
+        return []
+
+    onset_seconds = onset_frame * hop_length / sample_rate
+    seconds_per_tick = tempo / (ticks_per_beat * 1_000_000)
+    return [
+        note
+        for note in notes
+        if note["start_tick"] * seconds_per_tick >= onset_seconds - 0.08
+    ]
 
 
 def write_notes_midi(source: Path, destination: Path, notes: list[dict[str, Any]]) -> None:
@@ -294,16 +475,24 @@ def detect_lead_start(
     onset_groups: dict[int, list[dict[str, Any]]],
     ticks_per_beat: int,
 ) -> int | None:
+    return min(lead_phrase_onsets(onset_groups, ticks_per_beat), default=None)
+
+
+def lead_phrase_onsets(
+    onset_groups: dict[int, list[dict[str, Any]]],
+    ticks_per_beat: int,
+) -> set[int]:
     candidates = [
         (onset, next(iter(pitches)))
         for onset, group in sorted(onset_groups.items())
         if len(pitches := {note["pitch"] for note in group}) == 1
         and next(iter(pitches)) >= 60
     ]
-    phrase: list[tuple[int, int]] = []
+    phrases: list[list[tuple[int, int]]] = []
+    current: list[tuple[int, int]] = []
     max_gap = ticks_per_beat * 3
 
-    def is_lead_phrase() -> bool:
+    def is_lead_phrase(phrase: list[tuple[int, int]]) -> bool:
         pitches = {pitch for _, pitch in phrase}
         return (
             len(phrase) >= 6
@@ -313,13 +502,14 @@ def detect_lead_start(
         )
 
     for candidate in candidates:
-        if phrase and candidate[0] - phrase[-1][0] > max_gap:
-            if is_lead_phrase():
-                return phrase[0][0]
-            phrase = []
-        phrase.append(candidate)
-
-    return phrase[0][0] if phrase and is_lead_phrase() else None
+        if current and candidate[0] - current[-1][0] > max_gap:
+            if is_lead_phrase(current):
+                phrases.append(current)
+            current = []
+        current.append(candidate)
+    if current and is_lead_phrase(current):
+        phrases.append(current)
+    return {onset for phrase in phrases for onset, _ in phrase}
 
 
 def split_guitar_midi(
@@ -334,67 +524,16 @@ def split_guitar_midi(
         onset = round(note["start_tick"] / onset_window) * onset_window
         onset_groups[onset].append(note)
 
-    lead_start = detect_lead_start(onset_groups, midi.ticks_per_beat)
+    phrase_onsets = lead_phrase_onsets(onset_groups, midi.ticks_per_beat)
     lead: list[dict[str, Any]] = []
     for onset, group in sorted(onset_groups.items()):
-        if (
-            lead_start is not None
-            and onset >= lead_start
-            and len({note["pitch"] for note in group}) == 1
-        ):
+        if onset in phrase_onsets:
             lead.extend(group)
 
     lead_start_tick = min((note["start_tick"] for note in lead), default=None)
     lead_path = job_dir / "guitar_lead.mid"
     write_notes_midi(source, lead_path, lead)
     return lead_path, notes, lead_start_tick
-
-
-@lru_cache(maxsize=1)
-def load_lyrics_model() -> Any:
-    import whisper
-
-    return whisper.load_model("base")
-
-
-def transcribe_lyrics(audio_path: Path) -> list[dict[str, Any]]:
-    try:
-        transcription = load_lyrics_model().transcribe(
-            str(audio_path),
-            word_timestamps=True,
-            fp16=False,
-            verbose=False,
-        )
-    except (OSError, RuntimeError, urllib.error.URLError) as error:
-        raise HTTPException(
-            status_code=503,
-            detail="Could not load the offline lyrics model. Check your internet connection for its first download, then try again.",
-        ) from error
-
-    lines: list[dict[str, Any]] = []
-    for segment in transcription["segments"]:
-        segment_words = segment.get("words") or [
-            {
-                "start": segment["start"],
-                "end": segment["end"],
-                "word": segment["text"],
-            }
-        ]
-        words: list[dict[str, Any]] = []
-        for word in segment_words:
-            text = str(word.get("word", ""))
-            if text.strip():
-                start = max(0.0, float(word["start"]))
-                words.append(
-                    {
-                        "start": start,
-                        "end": max(start, float(word["end"])),
-                        "text": text,
-                    }
-                )
-        if words:
-            lines.append({"start": words[0]["start"], "words": words})
-    return lines
 
 
 def midi_tempo(midi: mido.MidiFile) -> int:
@@ -429,7 +568,7 @@ def write_guitar_tab(
 ) -> None:
     tunings = (40, 45, 50, 55, 59, 64)
     string_names = ("E", "A", "D", "G", "B", "e")
-    fret_limit = 20
+    fret_limit = 24
     positions: list[list[tuple[int, int]]] = [[] for _ in tunings]
     for note in sorted(notes, key=lambda item: item["start_tick"]):
         candidates = [
@@ -463,44 +602,89 @@ def write_guitar_tab(
 
 
 def chord_timeline(
-    note_sets: list[list[dict[str, Any]]],
+    notes: list[dict[str, Any]],
     ticks_per_beat: int,
     tempo: int,
+    style: str = "song",
 ) -> list[dict[str, Any]]:
     bins: dict[int, Counter[int]] = defaultdict(Counter)
-    for notes in note_sets:
-        for note in notes:
-            beat = round(note["start_tick"] / max(1, ticks_per_beat))
-            bins[beat // 2][note["pitch"] % 12] += max(
-                1, note["end_tick"] - note["start_tick"]
+    ticks_per_window = max(1, ticks_per_beat * 2)
+    for note in notes:
+        start = max(0, note["start_tick"])
+        end = max(start + 1, note["end_tick"])
+        first_window = start // ticks_per_window
+        last_window = (end - 1) // ticks_per_window
+        for window_index in range(first_window, last_window + 1):
+            window_start = window_index * ticks_per_window
+            overlap = min(end, window_start + ticks_per_window) - max(
+                start, window_start
             )
+            if overlap > 0:
+                bins[window_index][note["pitch"] % 12] += overlap * max(
+                    1, note.get("velocity", 1)
+                )
 
-    triads = (
+    chord_types = (
         ("", (0, 4, 7)),
         ("m", (0, 3, 7)),
         ("dim", (0, 3, 6)),
         ("aug", (0, 4, 8)),
         ("sus2", (0, 2, 7)),
         ("sus4", (0, 5, 7)),
+        ("7", (0, 4, 7, 10)),
+        ("maj7", (0, 4, 7, 11)),
+        ("m7", (0, 3, 7, 10)),
+        ("mMaj7", (0, 3, 7, 11)),
+        ("dim7", (0, 3, 6, 9)),
+        ("m7b5", (0, 3, 6, 10)),
+        ("6", (0, 4, 7, 9)),
+        ("m6", (0, 3, 7, 9)),
+        ("add9", (0, 2, 4, 7)),
+        ("9", (0, 2, 4, 7, 10)),
+        ("5", (0, 7)),
     )
+    if style == "basic":
+        chord_types = (("", (0, 4, 7)), ("m", (0, 3, 7)), ("5", (0, 7)))
     timeline: list[dict[str, Any]] = []
-    previous = ""
     for bin_index, pitch_weights in sorted(bins.items()):
-        if len(pitch_weights) < 3:
+        if len(pitch_weights) < 2:
             continue
-        chord_name = ""
-        chord_score = 0
+        total_weight = sum(pitch_weights.values())
+        best_chord: str | None = None
+        best_score = float("-inf")
         for root in range(12):
-            for suffix, intervals in triads:
-                score = sum(pitch_weights[(root + interval) % 12] for interval in intervals)
-                if score > chord_score:
-                    chord_score = score
-                    chord_name = f"{PITCH_NAMES[root]}{suffix}"
-        if chord_name and chord_name != previous:
+            for suffix, intervals in chord_types:
+                if len(pitch_weights) < 3 and suffix != "5":
+                    continue
+                chord_tones = {(root + interval) % 12 for interval in intervals}
+                matched_weight = sum(
+                    weight
+                    for pitch, weight in pitch_weights.items()
+                    if pitch in chord_tones
+                )
+                coverage = matched_weight / total_weight
+                root_weight = pitch_weights[root] / total_weight
+                score = coverage + root_weight * 0.12 - (len(intervals) - 3) * 0.025
+                if score > best_score:
+                    best_score = score
+                    best_chord = f"{PITCH_NAMES[root]}{suffix}"
+        threshold = 0.74 if style == "basic" else 0.68
+        if best_chord and best_score >= threshold:
             time_seconds = bin_index * 2 * tempo / 1_000_000
-            timeline.append({"name": chord_name, "time": time_seconds})
-            previous = chord_name
-    return timeline[:100]
+            if timeline and timeline[-1]["name"] == best_chord:
+                continue
+            timeline.append({"name": best_chord, "time": time_seconds})
+
+    if style == "song":
+        for index in range(1, len(timeline) - 1):
+            if timeline[index - 1]["name"] == timeline[index + 1]["name"]:
+                timeline[index]["name"] = timeline[index - 1]["name"]
+        timeline = [
+            chord
+            for index, chord in enumerate(timeline)
+            if index == 0 or chord["name"] != timeline[index - 1]["name"]
+        ]
+    return timeline
 
 
 def find_midi(output_dir: Path) -> Path:
@@ -520,14 +704,13 @@ def health() -> dict[str, Any]:
     ffmpeg_ready = resolve_command("ffmpeg") is not None
     ffprobe_ready = resolve_command("ffprobe") is not None
     onnx_ready = find_spec("onnxruntime") is not None
-    whisper_ready = find_spec("whisper") is not None
+    solola_ready = find_spec("librosa") is not None
     engine_ready = (
         demucs_ready
         and basic_pitch_ready
         and ffmpeg_ready
         and ffprobe_ready
         and onnx_ready
-        and whisper_ready
     )
     access_required = password_required()
     access_configured = (
@@ -547,8 +730,6 @@ def health() -> dict[str, Any]:
         missing.append("FFprobe")
     if not onnx_ready:
         missing.append("ONNX Runtime")
-    if not whisper_ready:
-        missing.append("Whisper")
     if not access_configured:
         missing.append("a server access password (at least 16 characters)")
     return {
@@ -558,13 +739,17 @@ def health() -> dict[str, Any]:
         else f"Server setup is incomplete: {', '.join(missing)}.",
         "password_required": access_required,
         "access_configured": access_configured,
+        "solola_compatible_ready": solola_ready,
+        "solola_compatible_message": "SoloLa-style pitch extraction is available in this engine."
+        if solola_ready
+        else "Install the engine requirements to enable librosa-based pitch extraction.",
         "components": {
             "demucs": demucs_ready,
             "basic_pitch": basic_pitch_ready,
             "ffmpeg": ffmpeg_ready,
             "ffprobe": ffprobe_ready,
             "onnx_runtime": onnx_ready,
-            "whisper": whisper_ready,
+            "solola_compatible": solola_ready,
         },
     }
 
@@ -577,13 +762,33 @@ def verify_shared_password() -> dict[str, bool]:
 @app.post("/api/analyze")
 async def analyze(
     file: UploadFile = File(...),
+    parts: str = Form("all"),
+    chord_style: str = Form("song"),
+    lead_engine: str = Form("basic_pitch"),
 ) -> dict[str, Any]:
+    available_parts = {"vocals", "piano", "guitar_chords", "guitar_lead", "bass"}
+    selected_parts = available_parts if parts == "all" else set(parts.split(","))
+    if not selected_parts or not selected_parts.issubset(available_parts):
+        raise HTTPException(status_code=400, detail="Choose at least one supported song part.")
+    if chord_style not in {"basic", "song", "complex"}:
+        raise HTTPException(status_code=400, detail="Choose a supported chord style.")
+    if lead_engine not in {"basic_pitch", "solola_compatible"}:
+        raise HTTPException(status_code=400, detail="Choose a supported guitar lead engine.")
+    if lead_engine == "solola_compatible" and "guitar_lead" not in selected_parts:
+        raise HTTPException(
+            status_code=400,
+            detail="Select Guitar lead to use the SoloLa engine.",
+        )
     extension = Path(file.filename or "").suffix.lower()
     if extension not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=415, detail="Unsupported audio format.")
     demucs_command = resolve_command("demucs")
     basic_pitch_command = resolve_command("basic-pitch")
-    if demucs_command is None or basic_pitch_command is None:
+    needs_transcription = bool(
+        {"piano", "guitar_chords"} & selected_parts
+        or ("guitar_lead" in selected_parts and lead_engine == "basic_pitch")
+    )
+    if demucs_command is None or (needs_transcription and basic_pitch_command is None):
         raise HTTPException(
             status_code=503,
             detail="Install the local engine requirements before analyzing audio.",
@@ -629,7 +834,18 @@ async def analyze(
         raise HTTPException(status_code=500, detail="The separator did not produce its expected stems.")
 
     files: list[dict[str, str]] = []
+    requested_stems = set()
+    if "piano" in selected_parts:
+        requested_stems.add("piano")
+    if {"guitar_chords", "guitar_lead"} & selected_parts:
+        requested_stems.add("guitar")
+    if "bass" in selected_parts:
+        requested_stems.add("bass")
+    if "vocals" in selected_parts:
+        requested_stems.add("vocals")
     for stem in ("piano", "guitar", "bass", "vocals"):
+        if stem not in requested_stems:
+            continue
         stem_path = separated_dir / f"{stem}.mp3"
         if stem_path.is_file():
             saved_stem = job_dir / f"{stem}.wav"
@@ -663,21 +879,35 @@ async def analyze(
 
     midi_dir = job_dir / "transcription"
     midi_dir.mkdir()
-    note_sets: list[list[dict[str, Any]]] = []
     piano_note_count = 0
     guitar_note_count = 0
     visual_tracks: dict[str, list[dict[str, float | int]]] = {
         "piano": [],
         "guitar_lead": [],
     }
-    lyrics: list[dict[str, Any]] = []
     guitar_lead_start_seconds: float | None = None
+    guitar_chord_notes: list[dict[str, Any]] = []
+    piano_chord_notes: list[dict[str, Any]] = []
+    guitar_ticks_per_beat = 480
+    guitar_tempo = 500_000
+    piano_ticks_per_beat = 480
+    piano_tempo = 500_000
+    guitar_tab_notes: list[dict[str, Any]] = []
+    guitar_tab_path: Path | None = None
+    guitar_tab_ticks_per_beat = 480
     tempo_bpm = 120
     piano_stem = job_dir / "piano.wav"
     guitar_stem = job_dir / "guitar.wav"
     for stem_path in (piano_stem, guitar_stem):
         if not stem_path.is_file():
             continue
+        if stem_path.stem == "guitar" and lead_engine == "solola_compatible" and "guitar_chords" not in selected_parts:
+            continue
+        if basic_pitch_command is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Basic Pitch is required to transcribe the selected song parts.",
+            )
         stem_output = midi_dir / stem_path.stem
         stem_output.mkdir()
         await run_command_async(
@@ -695,12 +925,22 @@ async def analyze(
         saved_midi = job_dir / f"{stem_path.stem}.mid"
         shutil.copy2(generated_midi, saved_midi)
         notes = midi_notes(saved_midi)
-        note_sets.append(notes)
 
         if stem_path.stem == "piano":
+            piano_midi = mido.MidiFile(saved_midi)
+            piano_ticks_per_beat = piano_midi.ticks_per_beat
+            piano_tempo = midi_tempo(piano_midi)
+            notes = remove_notes_before_audio_onset(
+                notes,
+                stem_path,
+                piano_ticks_per_beat,
+                piano_tempo,
+            )
+            write_notes_midi(saved_midi, saved_midi, notes)
+            piano_chord_notes = notes
             piano_note_count = len(notes)
             visual_tracks["piano"] = midi_visual_events(saved_midi)
-            tempo_bpm = round(60_000_000 / midi_tempo(mido.MidiFile(saved_midi)))
+            tempo_bpm = round(60_000_000 / piano_tempo)
             files.append(
                 {
                     "label": "Piano MIDI",
@@ -708,81 +948,118 @@ async def analyze(
                     "url": f"/api/jobs/{job_id}/files/{saved_midi.name}",
                 }
             )
-        else:
+        elif stem_path.stem == "guitar":
             guitar_note_count = len(notes)
             source_midi = mido.MidiFile(saved_midi)
-            lead_path, guitar_notes, lead_start_tick = split_guitar_midi(saved_midi, job_dir)
-            lead_notes = midi_notes(lead_path)
-            visual_tracks["guitar_lead"] = midi_visual_events(lead_path)
-            note_sets[-1] = guitar_notes
+            guitar_ticks_per_beat = source_midi.ticks_per_beat
+            guitar_tempo = midi_tempo(source_midi)
             tempo_bpm = round(60_000_000 / midi_tempo(source_midi))
-            if lead_start_tick is not None:
-                seconds_per_tick = midi_tempo(source_midi) / (
-                    source_midi.ticks_per_beat * 1_000_000
-                )
-                guitar_lead_start_seconds = round(
-                    lead_start_tick * seconds_per_tick,
-                    2,
-                )
-            tab_chords = chord_timeline(
-                note_sets,
-                source_midi.ticks_per_beat,
-                midi_tempo(source_midi),
-            )
-            files.extend(
-                [
+            if "guitar_chords" in selected_parts:
+                guitar_chord_notes = notes
+            if "guitar_lead" in selected_parts and lead_engine == "basic_pitch":
+                lead_path, _, lead_start_tick = split_guitar_midi(saved_midi, job_dir)
+                guitar_tab_notes = midi_notes(lead_path)
+                guitar_tab_ticks_per_beat = source_midi.ticks_per_beat
+                guitar_tab_path = job_dir / "guitar_tab.txt"
+                visual_tracks["guitar_lead"] = midi_visual_events(lead_path)
+                if lead_start_tick is not None:
+                    seconds_per_tick = midi_tempo(source_midi) / (
+                        source_midi.ticks_per_beat * 1_000_000
+                    )
+                    guitar_lead_start_seconds = round(
+                        lead_start_tick * seconds_per_tick,
+                        2,
+                    )
+                files.append(
                     {
                         "label": "Guitar MIDI",
                         "kind": "midi",
                         "url": f"/api/jobs/{job_id}/files/{lead_path.name}",
-                    },
-                ]
-            )
-            tab_path = job_dir / "guitar_tab.txt"
-            write_guitar_tab(
-                lead_notes,
-                tab_path,
-                source_midi.ticks_per_beat,
-                tab_chords,
-            )
-            files.append(
-                {
-                    "label": "Guitar TAB",
-                    "kind": "tab",
-                    "url": f"/api/jobs/{job_id}/files/{tab_path.name}",
-                }
-            )
+                    }
+                )
 
-    vocals_stem = job_dir / "vocals.wav"
-    if vocals_stem.is_file():
-        lyrics = await asyncio.to_thread(transcribe_lyrics, vocals_stem)
+    if "guitar_lead" in selected_parts and lead_engine == "solola_compatible":
+        if not guitar_stem.is_file():
+            raise HTTPException(
+                status_code=422,
+                detail="Demucs did not return a guitar stem for SoloLa to analyze.",
+            )
+        lead_notes = await asyncio.to_thread(solola_compatible_lead_notes, guitar_stem)
+        guitar_tab_path = job_dir / "guitar_tab.txt"
+        lead_midi_path = job_dir / "guitar_lead.mid"
+        guitar_tab_ticks_per_beat = 480
+        guitar_tab_notes = write_visual_notes_midi(
+            lead_notes,
+            lead_midi_path,
+            guitar_tab_ticks_per_beat,
+            500_000,
+        )
+        visual_tracks["guitar_lead"] = midi_visual_events(lead_midi_path)
+        guitar_lead_start_seconds = round(
+            min(float(note["start"]) for note in lead_notes),
+            2,
+        )
+        guitar_note_count = len(lead_notes)
+        files.append(
+            {
+                "label": "Guitar MIDI",
+                "kind": "midi",
+                "url": f"/api/jobs/{job_id}/files/{lead_midi_path.name}",
+            }
+        )
 
-    midi_for_tempo = job_dir / "piano.mid" if (job_dir / "piano.mid").is_file() else job_dir / "guitar.mid"
-    ticks_per_beat = mido.MidiFile(midi_for_tempo).ticks_per_beat if midi_for_tempo.is_file() else 480
     duration_seconds = 0.0
     for stem_path in (piano_stem, guitar_stem, job_dir / "bass.wav", job_dir / "vocals.wav"):
         if stem_path.is_file():
             with wave.open(str(stem_path), "rb") as audio_file:
                 duration_seconds = audio_file.getnframes() / audio_file.getframerate()
             break
-    tempo = 500_000
-    for midi_path in (job_dir / "piano.mid", job_dir / "guitar.mid"):
-        if not midi_path.is_file():
-            continue
-        midi_file = mido.MidiFile(midi_path)
-        tempo = midi_tempo(midi_file)
-        break
-    chords = chord_timeline(note_sets, ticks_per_beat, tempo)
+    chords = []
+    chord_source = None
+    if "guitar_chords" in selected_parts:
+        chords = chord_timeline(
+            guitar_chord_notes,
+            guitar_ticks_per_beat,
+            guitar_tempo,
+            chord_style,
+        )
+        if chords:
+            chord_source = "guitar"
+        elif "piano" in selected_parts:
+            chords = chord_timeline(
+                piano_chord_notes,
+                piano_ticks_per_beat,
+                piano_tempo,
+                chord_style,
+            )
+            if chords:
+                chord_source = "piano"
+    if guitar_tab_path is not None:
+        write_guitar_tab(
+            guitar_tab_notes,
+            guitar_tab_path,
+            guitar_tab_ticks_per_beat,
+            chords,
+        )
+        files.append(
+            {
+                "label": "Guitar TAB",
+                "kind": "tab",
+                "url": f"/api/jobs/{job_id}/files/{guitar_tab_path.name}",
+            }
+        )
     warnings = [
         "Automatic transcriptions are drafts and may need musical correction.",
-        "Chord labels and lead entry are inferred from one guitar stem; the lead tab is filtered to monophonic melody candidates and may omit or misclassify notes.",
+        "Chord labels use the separated guitar stem first, with the piano stem as a fallback; the lead tab is filtered to monophonic melody candidates and may omit or misclassify notes.",
     ]
     return {
         "id": job_id,
         "duration_seconds": duration_seconds,
         "chords": chords,
+        "chord_source": chord_source,
+        "selected_parts": sorted(selected_parts),
+        "lead_engine": lead_engine,
         "files": files,
-        "lyrics": lyrics,
         "notes": {"piano": piano_note_count, "guitar": guitar_note_count},
         "visual_tracks": visual_tracks,
         "guitar_lead_start_seconds": guitar_lead_start_seconds,
@@ -808,6 +1085,11 @@ def root():
         "health": "/api/health",
         "docs": "/docs",
     }
+
+
+@app.head("/")
+def root_health_check() -> Response:
+    return Response(status_code=200)
 
 
 @app.get("/{frontend_path:path}")
